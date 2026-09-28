@@ -633,6 +633,16 @@ input.invalid {
   font-size: 12px;
 }
 
+/* ---- 本地存储降级横幅（仅本页内存） ---- */
+
+.storage-degraded-banner {
+  margin: 0 0 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+
 /* ---- 加密分享：模态框 / 解锁页 / 预览 ---- */
 
 .modal-overlay {

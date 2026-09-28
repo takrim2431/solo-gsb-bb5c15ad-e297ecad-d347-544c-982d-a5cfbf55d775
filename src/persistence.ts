@@ -22,8 +22,17 @@ import {
  *    读回校验确认本次写入完整且未被并发写入方替换后，再提交主键并清理临时键，
  *    刷新 / 崩溃落在任何一步都只会看到「上一份完整数据」或「本次完整数据」，
  *    绝不会出现半写入状态。
- * 4. **永不抛错**：存储不可用（隐私模式、配额耗尽等）时退回进程内内存存储，
- *    应用启动与正常使用不被阻塞。
+ * 4. **永不抛错 + 内存降级镜像**：存储读得到但写不进（典型：配额耗尽，
+ *    localStorage.getItem 仍返回旧数据、setItem 抛 QuotaExceededError）时，
+ *    绝不允许「保存按失败处理、下次读回又拿到磁盘旧值」的混读。浏览器存储由统一的
+ *    降级适配器承载（规则表与回归数据共用同一适配器 / 同一份内存副本）：
+ *      - 正常期每次成功的读、写、删除都镜像进内存 Map；
+ *      - 任一读 / 写 / 删除抛错后，本页面后续对所有键一律只走该内存副本
+ *        （读得到镜像、写与删都在副本内完成），不再触碰磁盘、不再混读磁盘旧值；
+ *      - 因而临时键写入、读回、主键提交或清理任一步抛错，本次数据在内存中仍然完整：
+ *        保存结果按「仅内存」告知界面，同页重读得到最新值，已删除的键不会复活。
+ *    刷新后磁盘仍是旧值（配额不释放就写不进），界面必须明确提示「仅本页临时保存、
+ *    刷新可能丢失」，且不得把内存保存显示为已持久化。
  *
  * 历史 localStorage 键（裸数组 / 无版本号对象）作为 version 0 遗留数据被
  * 原地识别并迁移，主键名保持不变。
@@ -86,6 +95,11 @@ export interface LoadResult<T> {
   recoveredFromTemp: boolean;
   /** 底层存储是否不可用（已全程退回内存，value 只能是默认值） */
   storageUnavailable: boolean;
+  /**
+   * 底层存储是否已降级为「仅本页内存」（启动即不可用，或运行中读 / 写 / 删抛错后降级）。
+   * 为 true 时 value 来自内存副本：同页读写删都一致，但刷新后不会保留。
+   */
+  degraded: boolean;
 }
 
 export interface SaveResult {
@@ -94,8 +108,13 @@ export interface SaveResult {
   invalidData?: string;
   /** 临时键被并发写入方替换：本次写入已安全中止，未改动主键与对方的临时键 */
   abortedConflict?: boolean;
-  /** 存储层报错（配额 / 不可用等）的细节 */
+  /** 存储层报错（配额 / 不可用等）的细节；与 degraded 同时出现时数据已保全在内存副本 */
   storageError?: string;
+  /**
+   * 本次保存是否只落在本页内存副本（存储已降级）：数据在本页面完整可读，
+   * 但没有持久化到磁盘，刷新可能丢失。界面不得把这种情况显示为「已保存到本地」。
+   */
+  degraded?: boolean;
 }
 
 /** 极简存储接口：localStorage 与测试内存存储共同实现 */
@@ -103,6 +122,13 @@ export interface StorageLike {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
   removeItem(key: string): void;
+  /**
+   * 是否已降级为「仅本页内存」（降级适配器实现；裸内存 / 抛错式测试存储无此方法）。
+   * 一旦为 true，本页面生命周期内不再恢复——配额不会凭空释放，避免反复抖动混读。
+   */
+  isDegraded?(): boolean;
+  /** 订阅降级状态翻转（正常 → 降级恰好通知一次） */
+  subscribeDegraded?(listener: () => void): () => void;
 }
 
 export interface PersistenceDeps {
@@ -277,7 +303,7 @@ export function downloadDiagnostics(
   URL.revokeObjectURL(url);
 }
 
-// ---------- 默认依赖（浏览器 localStorage + 内存兜底） ----------
+// ---------- 默认依赖（浏览器 localStorage + 内存降级镜像） ----------
 
 const memoryStore = new Map<string, string>();
 const memoryStorage: StorageLike = {
@@ -286,38 +312,128 @@ const memoryStorage: StorageLike = {
   removeItem: (key) => void memoryStore.delete(key),
 };
 
-/** 浏览器 localStorage 的安全包装：任意方法抛错都退回共享内存存储 */
-function browserStorage(): StorageLike {
+/**
+ * 降级存储适配器（规则表、回归数据与诊断区共用同一实例 / 同一份内存副本）。
+ *
+ * 正常期所有读写都直达后端（浏览器 localStorage），并把每一次**成功的**
+ * 读 / 写 / 删除结果镜像进进程内 Map：读到的值入镜像，写入同步进镜像，
+ * 删除同时从镜像移除。这样一旦后端在任意一次操作中抛错（典型：配额耗尽时
+ * getItem 正常而 setItem 抛 QuotaExceededError），镜像里已经是该页此前成功
+ * 读写过的最新数据。
+ *
+ * 抛错后适配器**永久（本页面生命周期内）切换为仅内存模式**：
+ * - getItem 只返回镜像（绝不回读磁盘旧值，避免新数据与旧数据混读）；
+ * - setItem / removeItem 只改镜像（已删除的键不会因磁盘旧值复活）；
+ * - isDegraded() 翻为 true 并通知订阅者，供界面提示「仅本页临时保存」。
+ * 刷新页面后适配器重建：配额恢复则重新直读磁盘，否则从第一次抛错起再次降级。
+ */
+export interface DegradingStorage extends StorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+  isDegraded(): boolean;
+  subscribeDegraded(listener: () => void): () => void;
+}
+
+export function createDegradingStorage(backend: StorageLike): DegradingStorage {
+  const mirror = new Map<string, string>();
+  const degradeListeners = new Set<() => void>();
+  let degraded = false;
+
+  const enterDegraded = (): void => {
+    if (degraded) return;
+    degraded = true;
+    for (const listener of degradeListeners) {
+      try {
+        listener();
+      } catch {
+        // 订阅方报错不影响降级流程
+      }
+    }
+  };
+
   return {
     getItem(key) {
+      if (degraded) {
+        // 仅内存模式：只认镜像，绝不混读磁盘旧值
+        return mirror.has(key) ? (mirror.get(key) as string) : null;
+      }
       try {
-        return window.localStorage.getItem(key);
+        const value = backend.getItem(key);
+        // 镜像成功读到的磁盘值，供降级后继续使用
+        if (value === null) mirror.delete(key);
+        else mirror.set(key, value);
+        return value;
       } catch {
-        return memoryStorage.getItem(key);
+        enterDegraded();
+        return mirror.has(key) ? (mirror.get(key) as string) : null;
       }
     },
     setItem(key, value) {
+      if (degraded) {
+        mirror.set(key, value);
+        return;
+      }
       try {
-        window.localStorage.setItem(key, value);
+        backend.setItem(key, value);
+        // 后端确认成功后再镜像；后端写失败时镜像保留写入前的状态，
+        // 但调用方的原子写入流程会继续在镜像中提交新值（见 saveStore 的降级兜底）
+        mirror.set(key, value);
       } catch {
-        memoryStorage.setItem(key, value);
+        // 配额 / 拒绝访问：新值照常在内存副本中生效，本页不再碰磁盘
+        enterDegraded();
+        mirror.set(key, value);
       }
     },
     removeItem(key) {
-      try {
-        window.localStorage.removeItem(key);
-      } catch {
-        memoryStorage.removeItem(key);
+      if (degraded) {
+        mirror.delete(key);
+        return;
       }
+      try {
+        backend.removeItem(key);
+        mirror.delete(key);
+      } catch {
+        // 删除同样永久切到内存：已删除的键不允许被磁盘旧值带回来
+        enterDegraded();
+        mirror.delete(key);
+      }
+    },
+    isDegraded: () => degraded,
+    subscribeDegraded(listener) {
+      degradeListeners.add(listener);
+      return () => degradeListeners.delete(listener);
     },
   };
 }
 
+/** 浏览器 localStorage 经统一降级适配器包装；规则表与回归数据共用同一实例 */
+function createBrowserStorage(): DegradingStorage {
+  return createDegradingStorage({
+    getItem: (key) => window.localStorage.getItem(key),
+    setItem: (key, value) => window.localStorage.setItem(key, value),
+    removeItem: (key) => window.localStorage.removeItem(key),
+  });
+}
+
 export const defaultDeps: PersistenceDeps = {
-  storage: typeof window === 'undefined' ? memoryStorage : browserStorage(),
+  storage: typeof window === 'undefined' ? memoryStorage : createBrowserStorage(),
   now: () => new Date(),
   id: uid,
 };
+
+/** 默认存储（浏览器 localStorage 适配器）是否处于仅内存降级模式 */
+export function isStorageDegraded(deps: PersistenceDeps = defaultDeps): boolean {
+  return deps.storage.isDegraded?.() ?? false;
+}
+
+/** 订阅默认存储的降级状态（正常 → 降级）；供 React useSyncExternalStore 使用 */
+export function subscribeStorageDegraded(
+  listener: () => void,
+  deps: PersistenceDeps = defaultDeps,
+): () => void {
+  return deps.storage.subscribeDegraded?.(listener) ?? (() => undefined);
+}
 
 /** 供测试使用的全新内存存储 */
 export function createMemoryStorage(initial: Record<string, string> = {}): StorageLike {
@@ -530,15 +646,21 @@ export function loadStore<T>(
     mainText = readBlob(storage, def.key);
     tempText = readBlob(storage, tempKey);
   } catch {
-    // 存储完全不可用：默认值兜底，绝不阻塞启动
+    // 裸抛错式存储（未使用降级适配器）完全不可用：默认值兜底，绝不阻塞启动
     return {
       value: def.defaultValue(),
       migratedFrom: [],
       quarantined: [],
       recoveredFromTemp: false,
       storageUnavailable: true,
+      degraded: storage.isDegraded?.() ?? false,
     };
   }
+
+  // 降级适配器在读取抛错时会自身切换到仅内存模式：此时镜像为空意味着
+  // 启动即不可用、没有任何可读数据，按不可用处理（value 取默认值）。
+  const unavailableNow =
+    mainText === null && tempText === null && (storage.isDegraded?.() ?? false);
 
   const quarantined: QuarantineEntry[] = [];
   const quarantine = (
@@ -615,7 +737,8 @@ export function loadStore<T>(
     migratedFrom,
     quarantined,
     recoveredFromTemp,
-    storageUnavailable: false,
+    storageUnavailable: unavailableNow,
+    degraded: storage.isDegraded?.() ?? false,
   };
 }
 
@@ -756,7 +879,9 @@ export function saveStore<T>(
     // 残留的自有临时键在下次加载时因主键有效而被清理，无半写入风险
   }
 
-  return { ok: true };
+  // 经过降级适配器时，配额等异常已在适配器内部吞掉并转写内存副本：
+  // 此时 ok 表示「本页面数据完整」，degraded 提示这份完整只在内存、刷新可能丢失。
+  return { ok: true, degraded: storage.isDegraded?.() ?? false };
 }
 
 // ---------- 受管访问（应用层使用：默认值兜底 + 迁移后立即写回） ----------
@@ -799,6 +924,7 @@ export function loadManaged<T>(
       quarantined: [],
       recoveredFromTemp: false,
       storageUnavailable: false,
+      degraded: deps.storage.isDegraded?.() ?? false,
     };
   }
 

@@ -184,7 +184,8 @@ export function RegressionPanel({ rules }: Props) {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
 
   // 用例与基线经版本化持久化层原子写入（独立于规则表的存储键）；
-  // 校验不过不写任何键，存储不可用（隐私模式等）静默退回内存，不影响使用
+  // 校验不过不写任何键。存储写失败（配额 / 隐私模式等）时由统一降级适配器
+  // 保存在本页内存副本（顶部橙色横幅提示刷新可能丢失，不算持久化），不影响使用
   useEffect(() => {
     regressionManaged?.save(store);
   }, [store]);
