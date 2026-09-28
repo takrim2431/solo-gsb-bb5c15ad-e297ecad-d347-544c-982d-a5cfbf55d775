@@ -21,7 +21,10 @@ import {
   type SharePayload,
 } from './share';
 import { loadManaged, rulesStore, type ManagedStore } from './persistence';
-import { StorageDiagnosticsBanner } from './components/StorageDiagnosticsBanner';
+import {
+  StorageDiagnosticsBanner,
+  StorageHealthBanner,
+} from './components/StorageDiagnosticsBanner';
 
 /** 首次渲染时读取一次版本化存储（含历史数据迁移、损坏隔离、临时键恢复）；
  * 加载永不抛出，损坏数据回退为示例规则并可在诊断横幅中下载 */
@@ -80,7 +83,9 @@ export default function App() {
 
   useEffect(() => {
     // 经版本化持久化层原子写入：临时键校验通过后再替换主键，
-    // 刷新 / 崩溃落在任何一步都不会读到半写入数据；存储不可用时静默退回内存
+    // 刷新 / 崩溃落在任何一步都不会读到半写入数据；浏览器存储报错
+    // （配额 / 隐私模式等）后粘滞降级到本页内存副本，保存仍成功、
+    // 同页重读为最新值，页面顶部横幅明确提示刷新可能丢失
     rulesManaged?.save(rules);
   }, [rules]);
 
@@ -207,6 +212,7 @@ export default function App() {
 
   return (
     <div className="app">
+      <StorageHealthBanner />
       <StorageDiagnosticsBanner />
       <header className="app-header">
         <h1>URL 路由规则调试台</h1>

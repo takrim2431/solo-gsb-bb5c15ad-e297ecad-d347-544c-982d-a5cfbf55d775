@@ -5,6 +5,7 @@ import {
   type StoreDef,
   type StorageLike,
   clearQuarantine,
+  createFallbackStorage,
   createMemoryStorage,
   downloadDiagnostics,
   getQuarantineEntries,
@@ -16,6 +17,8 @@ import {
   rulesStore,
   saveStore,
   subscribeQuarantine,
+  subscribeStorageHealth,
+  getStorageHealth,
 } from './persistence';
 import { SAMPLE_RULES } from './samples';
 import type { Rule } from './types';
@@ -582,9 +585,9 @@ describe('并发写入顺序（临时键 nonce 归属校验）', () => {
   });
 });
 
-// ---------- 存储不可用 ----------
+// ---------- 存储完全抛错（未使用镜像适配器的原始 StorageLike） ----------
 
-describe('存储不可用（隐私模式 / 配额 / 拒绝访问）', () => {
+describe('底层存储始终抛错（安全网：永不阻塞应用）', () => {
   const broken: StorageLike = {
     getItem: () => {
       throw new Error('Access denied');
@@ -616,6 +619,278 @@ describe('存储不可用（隐私模式 / 配额 / 拒绝访问）', () => {
     const res = saveStore(rulesStore, [RULE], deps);
     expect(res.ok).toBe(false);
     expect(res.storageError).toMatch(/Quota|denied/i);
+    expect(res.memoryOnly).toBeUndefined();
     expect(() => loadManaged(rulesStore, deps).save([RULE])).not.toThrow();
+  });
+});
+
+// ---------- 镜像适配器：可读但写失败（配额耗尽） ----------
+
+describe('localStorage 可读但写入配额失败：粘滞降级到同一内存副本', () => {
+  /**
+   * 构造「磁盘上有旧规则、可正常读取，但任何写入（含临时键）都配额失败」的后端。
+   * 读一直可用，但降级后适配器不会再读磁盘——用于断言「不混读磁盘旧值」。
+   */
+  function quotaBackend(oldRules: unknown): {
+    backend: StorageLike;
+    disk: Map<string, string>;
+    setFails: { current: boolean };
+  } {
+    const disk = new Map<string, string>([
+      [rulesStore.key, JSON.stringify(envelope(1, oldRules))],
+    ]);
+    const setFails = { current: true };
+    const backend: StorageLike = {
+      getItem: (k) => (disk.has(k) ? (disk.get(k) as string) : null),
+      setItem: (k, v) => {
+        if (setFails.current) throw new Error('QuotaExceededError');
+        disk.set(k, v);
+      },
+      removeItem: (k) => void disk.delete(k),
+    };
+    return { backend, disk, setFails };
+  }
+
+  function depsWith(storage: StorageLike): PersistenceDeps {
+    return {
+      storage,
+      now: () => new Date('2026-09-26T08:00:00.000Z'),
+      id: () => 'id-1',
+    };
+  }
+
+  it('镜像已成功读入的磁盘数据；写配额失败后保存仍成功并标记 memoryOnly', () => {
+    const { backend, disk } = quotaBackend([RULE]);
+    const storage = createFallbackStorage(backend);
+    const deps = depsWith(storage);
+
+    // 首次加载读到旧规则，镜像同步建立
+    const first = loadStore(rulesStore, deps);
+    expect(first.value).toEqual([RULE]);
+    expect(first.storageUnavailable).toBe(false);
+    expect(storage.degraded).toBe(false);
+
+    const next: Rule[] = [{ ...RULE, id: 'r2', name: '规则二' }];
+    const res = saveStore(rulesStore, next, deps);
+    // 不再报「临时键写入后读回为空」：整套装保在内存副本中完成
+    expect(res.ok).toBe(true);
+    expect(res.memoryOnly).toBe(true);
+    expect(res.storageError).toBeUndefined();
+    expect(storage.degraded).toBe(true);
+
+    // 磁盘主键保持旧值（写不进去），临时键也不在磁盘上
+    expect(JSON.parse(disk.get(rulesStore.key) as string).data).toEqual([RULE]);
+    expect(disk.has(rulesStore.key + '.__tmp__')).toBe(false);
+  });
+
+  it('成功保存后同页重读得到最新值，绝不再混读磁盘旧规则', () => {
+    const { backend } = quotaBackend([RULE]);
+    const storage = createFallbackStorage(backend);
+    const deps = depsWith(storage);
+
+    loadStore(rulesStore, deps);
+    const next: Rule[] = [{ ...RULE, id: 'r2', name: '规则二' }];
+    expect(saveStore(rulesStore, next, deps).ok).toBe(true);
+
+    // 适配器直读：主键是新信封，临时键已清理
+    const main = JSON.parse(storage.getItem(rulesStore.key) as string);
+    expect(main.data).toEqual(next);
+    expect(storage.getItem(rulesStore.key + '.__tmp__')).toBeNull();
+
+    // 完整加载路径同样得到最新值，且没有触发临时键恢复 / 隔离
+    const reloaded = loadStore(rulesStore, deps);
+    expect(reloaded.value).toEqual(next);
+    expect(reloaded.recoveredFromTemp).toBe(false);
+    expect(reloaded.quarantined).toEqual([]);
+    expect(reloaded.storageUnavailable).toBe(false);
+
+    // 再保存第三份：持续使用同一内存副本
+    const third: Rule[] = [{ ...RULE, id: 'r3', name: '规则三' }];
+    const res3 = saveStore(rulesStore, third, deps);
+    expect(res3.ok).toBe(true);
+    expect(res3.memoryOnly).toBe(true);
+    expect(loadStore(rulesStore, deps).value).toEqual(third);
+  });
+
+  it('删除操作在内存副本生效，磁盘旧值不会让已删除键复活', () => {
+    const { backend } = quotaBackend([RULE]);
+    const storage = createFallbackStorage(backend);
+    const deps = depsWith(storage);
+    loadStore(rulesStore, deps);
+
+    // 删主键（后端删除本会成功，但此前写失败已让适配器降级）
+    expect(saveStore(rulesStore, [{ ...RULE, id: 'x' }], deps).ok).toBe(true);
+    storage.removeItem(rulesStore.key);
+    expect(storage.getItem(rulesStore.key)).toBeNull();
+    // 即便此后直接改读磁盘也拿得到旧值，适配器也绝不返回它
+    expect(backend.getItem(rulesStore.key)).not.toBeNull();
+    expect(storage.getItem(rulesStore.key)).toBeNull();
+
+    // 加载时以「键不存在」处理：回退默认值，而非磁盘上的旧规则
+    const loaded = loadStore(rulesStore, deps);
+    expect(loaded.value).toEqual(SAMPLE_RULES);
+    expect(loaded.quarantined).toEqual([]);
+  });
+
+  it('规则表与回归数据共用同一适配器：一处降级，两处都在同一内存副本读写', () => {
+    const disk = new Map<string, string>([
+      [rulesStore.key, JSON.stringify(envelope(1, [RULE]))],
+      [
+        regressionStore.key,
+        JSON.stringify(
+          envelope(1, {
+            baseline: null,
+            cases: [{ id: 'c1', method: 'GET', url: 'http://x.com/a' }],
+          }),
+        ),
+      ],
+    ]);
+    const quota: StorageLike = {
+      getItem: (k) => (disk.has(k) ? (disk.get(k) as string) : null),
+      setItem: () => {
+        throw new Error('QuotaExceededError');
+      },
+      removeItem: (k) => void disk.delete(k),
+    };
+    const storage = createFallbackStorage(quota);
+    const deps = depsWith(storage);
+
+    // 两库各自读到磁盘数据（镜像建立）
+    expect(loadStore(rulesStore, deps).value).toEqual([RULE]);
+    expect(loadStore(regressionStore, deps).value.cases).toHaveLength(1);
+
+    // 保存规则触发降级
+    expect(saveStore(rulesStore, [{ ...RULE, id: 'r2' }], deps).memoryOnly).toBe(
+      true,
+    );
+
+    // 回归数据的保存也在同一内存副本完成，读回为最新值，磁盘仍是旧值
+    const regNext = {
+      baseline: null,
+      cases: [
+        { id: 'c1', method: 'GET', url: 'http://x.com/a' },
+        { id: 'c2', method: 'POST', url: 'http://x.com/b' },
+      ],
+    };
+    const regRes = saveStore(regressionStore, regNext, deps);
+    expect(regRes.ok).toBe(true);
+    expect(regRes.memoryOnly).toBe(true);
+    expect(loadStore(regressionStore, deps).value.cases.map((c) => c.id)).toEqual([
+      'c1',
+      'c2',
+    ]);
+    const diskReg = JSON.parse(disk.get(regressionStore.key) as string);
+    expect(diskReg.data.cases).toHaveLength(1);
+
+    // 规则同页重读仍是降级保存的值
+    expect(loadStore(rulesStore, deps).value[0].id).toBe('r2');
+  });
+
+  it('降级是粘滞的：即使后端写能力恢复，本页面也不再触碰磁盘', () => {
+    const { backend, disk, setFails } = quotaBackend([RULE]);
+    const storage = createFallbackStorage(backend);
+    const deps = depsWith(storage);
+    loadStore(rulesStore, deps);
+
+    expect(saveStore(rulesStore, [{ ...RULE, id: 'r2' }], deps).ok).toBe(true);
+    expect(storage.degraded).toBe(true);
+
+    // 后端恢复可写（如其他标签页清出了配额），本页仍只用内存副本
+    setFails.current = false;
+    storage.setItem(rulesStore.key, JSON.stringify(envelope(1, [{ ...RULE, id: 'r3' }])));
+    expect(JSON.parse(disk.get(rulesStore.key) as string).data[0].id).toBe('r1');
+    expect(loadStore(rulesStore, deps).value[0].id).toBe('r3');
+  });
+
+  it('降级状态通过订阅实时通知，健康快照引用稳定', () => {
+    const { backend } = quotaBackend([RULE]);
+    const storage = createFallbackStorage(backend);
+    const deps = depsWith(storage);
+
+    const listener = vi.fn();
+    const off = storage.onDegrade(listener);
+    loadStore(rulesStore, deps);
+    expect(listener).not.toHaveBeenCalled();
+
+    saveStore(rulesStore, [{ ...RULE, id: 'r2' }], deps);
+    expect(listener).toHaveBeenCalledTimes(1);
+    // 已降级后继续出错不重复通知
+    saveStore(rulesStore, [{ ...RULE, id: 'r3' }], deps);
+    expect(listener).toHaveBeenCalledTimes(1);
+    off();
+  });
+
+  it('全新存储（磁盘无该键）首次写入即配额失败：内存中仍可完整保存与重读', () => {
+    const disk = new Map<string, string>();
+    const quota: StorageLike = {
+      getItem: (k) => (disk.has(k) ? (disk.get(k) as string) : null),
+      setItem: () => {
+        throw new Error('QuotaExceededError');
+      },
+      removeItem: (k) => void disk.delete(k),
+    };
+    const storage = createFallbackStorage(quota);
+    const deps = depsWith(storage);
+
+    const first = loadStore(rulesStore, deps);
+    expect(first.value).toEqual(SAMPLE_RULES);
+    // 尚未发生任何错误：不是降级导致的不可用
+    expect(first.storageUnavailable).toBe(false);
+
+    const res = saveStore(rulesStore, [RULE], deps);
+    expect(res.ok).toBe(true);
+    expect(res.memoryOnly).toBe(true);
+    expect(loadStore(rulesStore, deps).value).toEqual([RULE]);
+  });
+
+  it('读抛错（隐私模式拒绝访问）：镜像为空时 storageUnavailable=true，降级后保存进内存', () => {
+    const disk = new Map<string, string>();
+    let readsFail = true;
+    const privacy: StorageLike = {
+      getItem: (k) => {
+        if (readsFail) throw new Error('Access denied');
+        return disk.has(k) ? (disk.get(k) as string) : null;
+      },
+      setItem: (k, v) => disk.set(k, v),
+      removeItem: (k) => void disk.delete(k),
+    };
+    const storage = createFallbackStorage(privacy);
+    const deps = depsWith(storage);
+
+    const first = loadStore(rulesStore, deps);
+    expect(first.storageUnavailable).toBe(true);
+    expect(first.value).toEqual(SAMPLE_RULES);
+    expect(storage.degraded).toBe(true);
+
+    // 降级后即使后端读恢复，本页也只用内存副本；保存 / 重读在内存中闭环
+    readsFail = false;
+    const res = saveStore(rulesStore, [RULE], deps);
+    expect(res.ok).toBe(true);
+    expect(res.memoryOnly).toBe(true);
+    expect(loadStore(rulesStore, deps).value).toEqual([RULE]);
+  });
+
+  it('正常存储下不标记 memoryOnly，健康状态保持未降级', () => {
+    const storage = createFallbackStorage(createMemoryStorage());
+    const deps = depsWith(storage);
+    const res = saveStore(rulesStore, [RULE], deps);
+    expect(res.ok).toBe(true);
+    expect(res.memoryOnly).toBe(false);
+    expect(storage.degraded).toBe(false);
+    expect(getStorageHealth().degraded).toBe(false);
+  });
+});
+
+// ---------- 默认健康 API（默认适配器为单例，只验证导出形态与订阅注销） ----------
+
+describe('默认存储健康订阅', () => {
+  it('subscribeStorageHealth 返回注销函数，getStorageHealth 形态稳定', () => {
+    const snapshot1 = getStorageHealth();
+    const snapshot2 = getStorageHealth();
+    expect(snapshot2).toBe(snapshot1);
+    expect(typeof snapshot2.degraded).toBe('boolean');
+    const off = subscribeStorageHealth(() => undefined);
+    expect(typeof off).toBe('function');
+    off();
   });
 });

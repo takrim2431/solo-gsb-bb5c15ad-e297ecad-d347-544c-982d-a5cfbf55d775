@@ -601,6 +601,15 @@ input.invalid {
   margin: 0 0 12px;
 }
 
+/* 存储降级为「仅本页内存」时的提示（不能显示为已持久化） */
+.storage-health-banner {
+  margin: 0 0 12px;
+}
+
+.storage-health-banner strong {
+  color: var(--warn);
+}
+
 .storage-diag-head {
   display: flex;
   align-items: center;
